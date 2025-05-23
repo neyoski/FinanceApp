@@ -3,44 +3,37 @@ session_start();
 require_once '../includes/db.php';
 require_once '../includes/functions.php';
 
-checkResidentAuth();
+checkAdminAuth();
 
 $db = new Database();
 $conn = $db->getConnection();
-$userId = $_SESSION['user_id'];
 
-// Mark notification as read
-if (isset($_POST['mark_read']) && isset($_POST['notification_id'])) {
-    $notificationId = $_POST['notification_id'];
+$message = '';
+
+// Handle notification creation
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $title = $_POST['title'] ?? '';
+    $content = $_POST['content'] ?? '';
     
-    // Check if already marked as read
-    $stmt = $conn->prepare("SELECT id FROM notification_reads WHERE notification_id = ? AND user_id = ?");
-    $stmt->execute([$notificationId, $userId]);
-    
-    if ($stmt->rowCount() === 0) {
-        $stmt = $conn->prepare("INSERT INTO notification_reads (notification_id, user_id) VALUES (?, ?)");
-        $stmt->execute([$notificationId, $userId]);
+    if (empty($title) || empty($content)) {
+        $message = 'Error: Title and content are required.';
+    } else {
+        $stmt = $conn->prepare("
+            INSERT INTO notifications (title, message, created_by) 
+            VALUES (?, ?, ?)
+        ");
         
-        logActivity($conn, $userId, 'notification_read', 'User read notification #' . $notificationId);
+        if ($stmt->execute([$title, $content, $_SESSION['user_id']])) {
+            logActivity($conn, $_SESSION['user_id'], 'notification_created', 'Created new notification: ' . $title);
+            $message = 'Notification created successfully.';
+        } else {
+            $message = 'Error: Failed to create notification.';
+        }
     }
 }
 
-// Get all notifications with read status
-$stmt = $conn->prepare("
-    SELECT 
-        n.*, 
-        CASE WHEN nr.id IS NOT NULL THEN 1 ELSE 0 END as is_read
-    FROM notifications n
-    LEFT JOIN notification_reads nr ON n.id = nr.notification_id AND nr.user_id = ?
-    ORDER BY n.created_at DESC
-");
-$stmt->execute([$userId]);
-$notifications = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Count unread notifications
-$unreadCount = array_reduce($notifications, function($carry, $item) {
-    return $carry + ($item['is_read'] ? 0 : 1);
-}, 0);
+// Get all notifications
+$notifications = getNotifications($conn);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -48,48 +41,54 @@ $unreadCount = array_reduce($notifications, function($carry, $item) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notifications - Estate Finance Management</title>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="../assets/css/resident-notifications.css">
+    <link rel="stylesheet" href="../assets/css/admin-notifications.css">
 </head>
 <body>
     <div class="dashboard-container">
         <nav class="dashboard-nav">
-            <h2>Resident Dashboard</h2>
+            <h2>Admin Dashboard</h2>
             <ul>
                 <li><a href="dashboard.php">Dashboard</a></li>
+                <li><a href="residents.php">Residents</a></li>
                 <li><a href="payments.php">Payments</a></li>
                 <li><a href="notifications.php" class="active">Notifications</a></li>
-                <li><a href="profile.php">Profile</a></li>
                 <li><a href="../logout.php">Logout</a></li>
             </ul>
         </nav>
         
         <main class="dashboard-main">
-            <div class="dashboard-header">
-                <h3>Notifications</h3>
-                <?php if ($unreadCount > 0): ?>
-                    <span class="badge badge-warning"><?php echo $unreadCount; ?> unread</span>
-                <?php endif; ?>
+            <?php if ($message): ?>
+                <div class="alert <?php echo strpos($message, 'Error:') === 0 ? 'alert-danger' : 'alert-success'; ?>">
+                    <?php echo htmlspecialchars($message); ?>
+                </div>
+            <?php endif; ?>
+
+            <div class="dashboard-section">
+                <h3>Create New Notification</h3>
+                <form method="POST" class="notification-form">
+                    <div class="form-group">
+                        <label for="title">Title</label>
+                        <input type="text" id="title" name="title" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="content">Content</label>
+                        <textarea id="content" name="content" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Create Notification</button>
+                </form>
             </div>
 
             <div class="dashboard-section">
+                <h3>All Notifications</h3>
                 <div class="notification-list">
                     <?php if (empty($notifications)): ?>
                         <p>No notifications found.</p>
                     <?php else: ?>
                         <?php foreach ($notifications as $notification): ?>
-                            <div class="notification-item <?php echo $notification['is_read'] ? 'read' : 'unread'; ?>">
-                                <div class="notification-content">
-                                    <h4><?php echo htmlspecialchars($notification['title']); ?></h4>
-                                    <p><?php echo htmlspecialchars($notification['message']); ?></p>
-                                    <small><?php echo date('M j, Y H:i', strtotime($notification['created_at'])); ?></small>
-                                </div>
-                                <?php if (!$notification['is_read']): ?>
-                                    <form method="POST" class="notification-action">
-                                        <input type="hidden" name="notification_id" value="<?php echo $notification['id']; ?>">
-                                        <button type="submit" name="mark_read" class="btn btn-small">Mark as Read</button>
-                                    </form>
-                                <?php endif; ?>
+                            <div class="notification-item">
+                                <h4><?php echo htmlspecialchars($notification['title']); ?></h4>
+                                <p><?php echo htmlspecialchars($notification['message']); ?></p>
+                                <small><?php echo date('M j, Y H:i', strtotime($notification['created_at'])); ?></small>
                             </div>
                         <?php endforeach; ?>
                     <?php endif; ?>

@@ -3,107 +3,110 @@ session_start();
 require_once '../includes/db.php';
 require_once '../includes/functions.php';
 
-checkResidentAuth();
+checkAdminAuth();
 
 $db = new Database();
 $conn = $db->getConnection();
-$userId = $_SESSION['user_id'];
 $message = '';
 
-// Handle payment submission
+// Handle payment approval/rejection
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['submit_payment'])) {
-        $amount = $_POST['amount'] ?? '';
-        $payment_date = $_POST['payment_date'] ?? '';
-        $payment_method = $_POST['payment_method'] ?? '';
-        $reference_number = $_POST['reference_number'] ?? '';
-        $description = $_POST['description'] ?? '';
+    $payment_id = $_POST['payment_id'] ?? '';
+    $action = $_POST['action'] ?? '';
+    $admin_notes = $_POST['admin_notes'] ?? '';
+    
+    if (empty($payment_id) || empty($action)) {
+        $message = 'Error: Invalid request.';
+    } else {
+        // Get payment details
+        $stmt = $conn->prepare("SELECT user_id, amount FROM dues WHERE id = ?");
+        $stmt->execute([$payment_id]);
+        $payment = $stmt->fetch(PDO::FETCH_ASSOC);
         
-        if (empty($amount) || empty($payment_date) || empty($payment_method)) {
-            $message = 'Error: Amount, payment date, and payment method are required.';
-        } else {
-            // Handle file upload
-            $payment_proof = null;
-            if (isset($_FILES['payment_proof']) && $_FILES['payment_proof']['error'] === UPLOAD_ERR_OK) {
-                $file = $_FILES['payment_proof'];
-                
-                // Define upload directory
-                $uploadDir = __DIR__ . '/../assets/uploads/';
-                
-                // Create directory if it doesn't exist
-                if (!file_exists($uploadDir)) {
-                    mkdir($uploadDir, 0777, true);
-                }
-                
-                // Validate file type
-                if (!in_array($file['type'], ALLOWED_FILE_TYPES)) {
-                    $message = 'Error: Invalid file type. Please upload JPG, PNG or PDF files only.';
-                } else if ($file['size'] > MAX_FILE_SIZE) {
-                    $message = 'Error: File size too large. Maximum size is 5MB.';
-                } else {
-                    // Generate unique filename
-                    $extension = pathinfo($file['name'], PATHINFO_EXTENSION);
-                    $filename = uniqid() . '.' . $extension;
-                    $uploadPath = $uploadDir . $filename;
-                    
-                    if (move_uploaded_file($file['tmp_name'], $uploadPath)) {
-                        $payment_proof = $filename;
-                    } else {
-                        $message = 'Error: Failed to upload file.';
-                    }
-                }
-            }
+        if ($payment) {
+            $new_status = $action === 'approve' ? 'paid' : 'rejected';
+            $stmt = $conn->prepare("
+                UPDATE dues 
+                SET status = ?, 
+                    admin_approval = ?
+                WHERE id = ?
+            ");
             
-            if (empty($message)) {
-                // Insert payment record
-                $stmt = $conn->prepare("
-                    INSERT INTO dues (user_id, amount, due_date, status, payment_proof) 
-                    VALUES (?, ?, ?, 'pending', ?)
-                ");
+            if ($stmt->execute([
+                $new_status,
+                $action === 'approve' ? 1 : 0,
+                $payment_id
+            ])) {
+                // Log the activity
+                $activity = $action === 'approve' ? 'approved' : 'rejected';
+                logActivity($conn, $_SESSION['user_id'], 'payment_' . $activity, 
+                    'Payment #' . $payment_id . ' ' . $activity . ($admin_notes ? " - Note: $admin_notes" : ''));
                 
-                if ($stmt->execute([
-                    $userId, 
-                    $amount, 
-                    $payment_date, 
-                    $payment_proof
-                ])) {
-                    logActivity($conn, $userId, 'payment_submitted', 
-                        'Payment of ' . formatCurrency($amount) . ' submitted');
-                    $message = 'Payment submitted successfully.';
-                } else {
-                    $message = 'Error: Failed to submit payment.';
+                // Create notification for resident
+                $title = 'Payment ' . ucfirst($activity);
+                $notif_message = 'Your payment of ' . formatCurrency($payment['amount']) . 
+                    ' has been ' . $activity;
+                if ($admin_notes) {
+                    $notif_message .= ". Admin notes: " . $admin_notes;
                 }
+                
+                $stmt = $conn->prepare("
+                    INSERT INTO notifications (title, message, created_by) 
+                    VALUES (?, ?, ?)
+                ");
+                $stmt->execute([$title, $notif_message, $_SESSION['user_id']]);
+                
+                $message = 'Payment has been ' . $activity . ' successfully.';
+            } else {
+                $message = 'Error: Failed to update payment status.';
             }
+        } else {
+            $message = 'Error: Payment not found.';
         }
     }
 }
 
-// Get all payments for the user
+// Get all payments with user information
 $stmt = $conn->prepare("
-    SELECT * FROM dues 
-    WHERE user_id = ? 
-    ORDER BY created_at DESC
+    SELECT d.*, u.username, u.full_name, u.email
+    FROM dues d
+    JOIN users u ON d.user_id = u.id
+    ORDER BY d.created_at DESC
 ");
-$stmt->execute([$userId]);
+$stmt->execute();
 $payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Get payment statistics
+$stmt = $conn->prepare("
+    SELECT 
+        COUNT(*) as total_payments,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+        SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) as approved_count,
+        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected_count,
+        SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) as total_approved
+    FROM dues
+");
+$stmt->execute();
+$stats = $stmt->fetch(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Payments - Estate Finance Management</title>
-    <link rel="stylesheet" href="../assets/css/resident-payments.css">
+    <title>Payment Management - Estate Finance Management</title>
+    <link rel="stylesheet" href="../assets/css/admin-payments.css">
+    
 </head>
 <body>
     <div class="dashboard-container">
         <nav class="dashboard-nav">
-            <h2>Resident Dashboard</h2>
+            <h2>Admin Dashboard</h2>
             <ul>
                 <li><a href="dashboard.php">Dashboard</a></li>
+                <li><a href="residents.php">Residents</a></li>
                 <li><a href="payments.php" class="active">Payments</a></li>
                 <li><a href="notifications.php">Notifications</a></li>
-                <li><a href="profile.php">Profile</a></li>
                 <li><a href="../logout.php">Logout</a></li>
             </ul>
         </nav>
@@ -115,81 +118,94 @@ $payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 </div>
             <?php endif; ?>
 
-            <div class="dashboard-section">
-                <h3>Submit New Payment</h3>
-                <form method="POST" enctype="multipart/form-data" class="payment-form">
-                    <div class="form-group">
-                        <label for="amount">Amount (₦)</label>
-                        <input type="number" id="amount" name="amount" step="0.01" min="0" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="payment_date">Payment Date</label>
-                        <input type="date" id="payment_date" name="payment_date" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="payment_method">Payment Method</label>
-                        <select id="payment_method" name="payment_method" required>
-                            <option value="">Select Payment Method</option>
-                            <option value="bank_transfer">Bank Transfer</option>
-                            <option value="cash">Cash</option>
-                            <option value="cheque">Cheque</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="reference_number">Reference Number</label>
-                        <input type="text" id="reference_number" name="reference_number">
-                        <small>Transaction reference number or cheque number</small>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="description">Payment Description</label>
-                        <textarea id="description" name="description" rows="3"></textarea>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="payment_proof">Payment Proof</label>
-                        <input type="file" id="payment_proof" name="payment_proof" accept=".jpg,.jpeg,.png,.pdf" required>
-                        <small>Upload receipt or proof of payment (JPG, PNG, or PDF, max 5MB)</small>
-                    </div>
-
-                    <button type="submit" name="submit_payment" class="btn btn-primary">Submit Payment</button>
-                </form>
+            <div class="dashboard-stats payment-stats">
+                <div class="stat-card">
+                    <h3>Total Payments</h3>
+                    <p><?php echo $stats['total_payments']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Pending Approval</h3>
+                    <p><?php echo $stats['pending_count']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Approved Payments</h3>
+                    <p><?php echo $stats['approved_count']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Total Amount Approved</h3>
+                    <p><?php echo formatCurrency($stats['total_approved']); ?></p>
+                </div>
             </div>
 
             <div class="dashboard-section">
-                <h3>Payment History</h3>
-                <div class="payment-list">
+                <h3>Payment Management</h3>
+                <div class="payment-list admin-payment-list">
                     <?php if (empty($payments)): ?>
                         <p>No payments found.</p>
                     <?php else: ?>
                         <?php foreach ($payments as $payment): ?>
-                            <div class="payment-item">
+                            <div class="payment-item <?php echo $payment['status']; ?>">
                                 <div class="payment-info">
-                                    <h4><?php echo formatCurrency($payment['amount']); ?></h4>
-                                    <p>
-                                        <strong>Date:</strong> <?php echo date('M j, Y', strtotime($payment['due_date'])); ?><br>
-                                        <strong>Method:</strong> <?php echo ucfirst(str_replace('_', ' ', $payment['payment_method'])); ?><br>
-                                        <?php if ($payment['reference_number']): ?>
-                                            <strong>Reference:</strong> <?php echo htmlspecialchars($payment['reference_number']); ?><br>
-                                        <?php endif; ?>
-                                        <strong>Status:</strong> 
+                                    <div class="payment-header">
+                                        <h4><?php echo formatCurrency($payment['amount']); ?></h4>
                                         <span class="status status-<?php echo $payment['status']; ?>">
                                             <?php echo ucfirst($payment['status']); ?>
                                         </span>
-                                    </p>
-                                    <?php if ($payment['description']): ?>
-                                        <p class="payment-description">
-                                            <?php echo htmlspecialchars($payment['description']); ?>
+                                    </div>
+                                    <div class="resident-info">
+                                        <p>
+                                            <strong>Resident:</strong> <?php echo htmlspecialchars($payment['full_name']); ?> 
+                                            (<?php echo htmlspecialchars($payment['email']); ?>)
                                         </p>
+                                    </div>
+                                    <div class="payment-details">
+                                        <p>
+                                            <strong>Date:</strong> <?php echo date('M j, Y', strtotime($payment['due_date'])); ?><br>
+                                            <strong>Method:</strong> <?php echo ucfirst(str_replace('_', ' ', $payment['payment_method'])); ?><br>
+                                            <?php if ($payment['reference_number']): ?>
+                                                <strong>Reference:</strong> <?php echo htmlspecialchars($payment['reference_number']); ?><br>
+                                            <?php endif; ?>
+                                            <strong>Submitted:</strong> <?php echo date('M j, Y H:i', strtotime($payment['created_at'])); ?>
+                                        </p>
+                                    </div>
+                                    <?php if ($payment['description']): ?>
+                                        <div class="payment-description">
+                                            <strong>Description:</strong><br>
+                                            <?php echo htmlspecialchars($payment['description']); ?>
+                                        </div>
+                                    <?php endif; ?>
+                                    <?php if ($payment['admin_notes']): ?>
+                                        <div class="admin-notes">
+                                            <strong>Admin Notes:</strong><br>
+                                            <?php echo htmlspecialchars($payment['admin_notes']); ?>
+                                        </div>
                                     <?php endif; ?>
                                 </div>
+                                
                                 <?php if ($payment['payment_proof']): ?>
                                     <div class="payment-proof">
-                                        <p>Payment proof uploaded</p>
-                                        <small>Status: <?php echo $payment['admin_approval'] ? 'Approved' : 'Pending Approval'; ?></small>
+                                        <p>Payment proof available</p>
+                                        <a href="../assets/uploads/<?php echo htmlspecialchars($payment['payment_proof']); ?>" 
+                                           target="_blank" class="btn btn-small">View Proof</a>
+                                    </div>
+                                <?php endif; ?>
+                                
+                                <?php if ($payment['status'] === 'pending'): ?>
+                                    <div class="payment-actions">
+                                        <form method="POST" class="approval-form">
+                                            <input type="hidden" name="payment_id" value="<?php echo $payment['id']; ?>">
+                                            <div class="form-group">
+                                                <label for="admin_notes_<?php echo $payment['id']; ?>">Notes</label>
+                                                <textarea name="admin_notes" id="admin_notes_<?php echo $payment['id']; ?>" 
+                                                    rows="2" placeholder="Add any notes about this payment"></textarea>
+                                            </div>
+                                            <div class="button-group">
+                                                <button type="submit" name="action" value="approve" 
+                                                    class="btn btn-success btn-small">Approve</button>
+                                                <button type="submit" name="action" value="reject" 
+                                                    class="btn btn-danger btn-small">Reject</button>
+                                            </div>
+                                        </form>
                                     </div>
                                 <?php endif; ?>
                             </div>
